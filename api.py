@@ -4,7 +4,12 @@
 支持抖音、哔哩哔哩、小红书、快手、好看视频等平台
 """
 
+import base64
+import hashlib
 import os
+import re
+import subprocess
+import tempfile
 import time
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -17,6 +22,7 @@ from fastapi import FastAPI, Request, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from openai import OpenAI
 from pydantic import BaseModel
 
 from configs.logging_config import logger
@@ -40,6 +46,16 @@ class DownloadRequest(BaseModel):
     """下载请求模型"""
     video_url: str
     video_id: str
+
+
+class FrontendMediaRequest(BaseModel):
+    """React 前端媒体操作请求模型"""
+    video_url: str
+    video_id: str
+    platform: Optional[str] = ""
+    title: Optional[str] = ""
+    audio_url: Optional[str] = None
+    original_url: Optional[str] = None
 
 
 class APIResponse(BaseModel):
@@ -107,6 +123,192 @@ def validate_request_headers(
         return make_response(400, 'Decryption verification failed', None, None, False)
 
     return None
+
+
+# ==================== 前端媒体工具函数 ====================
+
+QWEN_API_BASE_URL = os.getenv('QWEN_API_BASE_URL', 'https://api-inference.modelscope.cn/v1')
+QWEN_API_KEY = os.getenv('QWEN_API_KEY', '')
+QWEN_MODEL_ID = os.getenv('QWEN_MODEL_ID', 'Qwen/Qwen3-VL-8B-Instruct')
+MAX_FRAMES = int(os.getenv('MAX_FRAMES', '6'))
+
+
+def media_slug(*parts: Optional[str]) -> str:
+    """生成 URL 安全的媒体文件名片段"""
+    source = next((part for part in parts if part), "video")
+    slug = re.sub(r'[^A-Za-z0-9_-]+', '-', source).strip('-')[:48]
+    if slug:
+        return slug
+    return hashlib.sha1(source.encode('utf-8')).hexdigest()[:16]
+
+
+def media_static_url(filename: str) -> str:
+    """生成可被浏览器访问的静态视频 URL"""
+    path = f"/static/videos/{filename}"
+    if DOMAIN:
+        return f"{DOMAIN.rstrip('/')}{path}"
+    return path
+
+
+def referer_for_media(request_body: FrontendMediaRequest) -> Optional[str]:
+    """根据来源平台补充下载 Referer"""
+    original_url = request_body.original_url or ""
+    platform = request_body.platform or ""
+    if 'douyin.com' in original_url or platform == '抖音':
+        return 'https://www.douyin.com/'
+    if 'bilibili.com' in original_url or platform == '哔哩哔哩':
+        return original_url or 'https://www.bilibili.com/'
+    if 'xiaohongshu.com' in original_url or platform == '小红书':
+        return 'https://www.xiaohongshu.com/'
+    if 'kuaishou.com' in original_url or platform == '快手':
+        return 'https://www.kuaishou.com/'
+    if 'haokan.baidu.com' in original_url or platform == '好看视频':
+        return 'https://haokan.baidu.com/'
+    return None
+
+
+def download_binary(url: str, output_path: str, referer: Optional[str] = None) -> None:
+    """流式下载远程媒体文件"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+    }
+    if referer:
+        headers['Referer'] = referer
+
+    response = requests.get(url, headers=headers, stream=True, timeout=180)
+    response.raise_for_status()
+    with open(output_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+
+def merge_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
+    """使用 ffmpeg 合并 B 站音视频轨道"""
+    result = subprocess.run(
+        [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', audio_path,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-strict', 'experimental',
+            output_path
+        ],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg 合并失败: {result.stderr}")
+
+
+def ensure_frontend_media(request_body: FrontendMediaRequest, prefix: str) -> tuple[str, str]:
+    """
+    为 React 前端准备可访问的 mp4 文件。
+
+    Returns:
+        (filename, file_path)
+    """
+    check_essential_dirs()
+    safe_id = media_slug(request_body.video_id, request_body.title, request_body.video_url)
+    filename = f"{prefix}-{safe_id}.mp4"
+    output_path = os.path.join(SAVE_VIDEO_PATH, filename)
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return filename, output_path
+
+    referer = referer_for_media(request_body)
+    try:
+        if request_body.platform == '哔哩哔哩' and request_body.audio_url:
+            temp_dir = tempfile.mkdtemp(prefix='frontend_media_')
+            video_temp = os.path.join(temp_dir, 'video.m4s')
+            audio_temp = os.path.join(temp_dir, 'audio.m4s')
+            try:
+                download_binary(request_body.video_url, video_temp, referer)
+                download_binary(request_body.audio_url, audio_temp, referer)
+                merge_video_audio(video_temp, audio_temp, output_path)
+            finally:
+                for temp_path in [video_temp, audio_temp]:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                try:
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+        else:
+            download_binary(request_body.video_url, output_path, referer)
+    except Exception:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
+
+    return filename, output_path
+
+
+def get_video_duration(video_path: str) -> float:
+    """获取视频时长（秒）"""
+    result = subprocess.run(
+        [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ],
+        capture_output=True,
+        text=True
+    )
+    try:
+        return float(result.stdout.strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_video_frames(video_path: str, num_frames: int = MAX_FRAMES) -> list[str]:
+    """等间隔抽取视频关键帧"""
+    duration = get_video_duration(video_path)
+    if duration <= 0:
+        duration = 60
+    interval = duration / (num_frames + 1)
+    temp_dir = tempfile.mkdtemp(prefix='video_frames_')
+    frames = []
+    for index in range(num_frames):
+        output_path = os.path.join(temp_dir, f'frame_{index:03d}.jpg')
+        result = subprocess.run(
+            [
+                'ffmpeg', '-y',
+                '-ss', str(interval * (index + 1)),
+                '-i', video_path,
+                '-vframes', '1',
+                '-q:v', '2',
+                output_path
+            ],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0 and os.path.exists(output_path):
+            frames.append(output_path)
+    return frames
+
+
+def image_to_base64(image_path: str) -> str:
+    """将图片转换为 base64 编码"""
+    with open(image_path, 'rb') as f:
+        return base64.b64encode(f.read()).decode('utf-8')
+
+
+def cleanup_frames(frames: list[str]) -> None:
+    """清理 AI 抽帧临时文件"""
+    if not frames:
+        return
+    temp_dir = os.path.dirname(frames[0])
+    for frame_path in frames:
+        try:
+            os.remove(frame_path)
+        except OSError:
+            pass
+    try:
+        os.rmdir(temp_dir)
+    except OSError:
+        pass
 
 
 # ==================== 应用生命周期 ====================
@@ -377,6 +579,186 @@ async def download_video(
             status_code=500,
             content=make_response(500, '功能太火爆啦，请稍后再试', None, None, False)
         )
+
+
+@app.post("/api/frontend/cache")
+async def frontend_cache_video(
+    body: FrontendMediaRequest,
+    x_timestamp: str = Header(default="", alias="X-Timestamp"),
+    x_gclt_text: str = Header(default="", alias="X-GCLT-Text"),
+    x_egct_text: str = Header(default="", alias="X-EGCT-Text"),
+):
+    """为 React 前端准备浏览器可播放的缓存视频"""
+    validation_error = validate_request_headers(
+        x_timestamp, x_gclt_text, x_egct_text, body.video_url, body.video_id
+    )
+    if validation_error:
+        return JSONResponse(status_code=400, content=validation_error)
+
+    try:
+        filename, output_path = ensure_frontend_media(body, "frontend-cache")
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        return JSONResponse(
+            status_code=200,
+            content=make_response(
+                200,
+                '成功',
+                {
+                    'play_url': media_static_url(filename),
+                    'file_name': filename,
+                    'size_mb': round(size_mb, 1),
+                    'cached': True
+                },
+                None,
+                True
+            )
+        )
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=500,
+            content=make_response(500, '未安装 ffmpeg，请先安装 ffmpeg', None, None, False)
+        )
+    except Exception as e:
+        logger.error(f"Frontend cache error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content=make_response(500, f'缓存失败: {str(e)}', None, None, False)
+        )
+
+
+@app.post("/api/frontend/download")
+async def frontend_download_video(
+    body: FrontendMediaRequest,
+    x_timestamp: str = Header(default="", alias="X-Timestamp"),
+    x_gclt_text: str = Header(default="", alias="X-GCLT-Text"),
+    x_egct_text: str = Header(default="", alias="X-EGCT-Text"),
+):
+    """为 React 前端准备浏览器可下载的视频文件"""
+    validation_error = validate_request_headers(
+        x_timestamp, x_gclt_text, x_egct_text, body.video_url, body.video_id
+    )
+    if validation_error:
+        return JSONResponse(status_code=400, content=validation_error)
+
+    try:
+        filename, output_path = ensure_frontend_media(body, "frontend-download")
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        return JSONResponse(
+            status_code=200,
+            content=make_response(
+                200,
+                '成功',
+                {
+                    'download_url': media_static_url(filename),
+                    'file_name': filename,
+                    'size_mb': round(size_mb, 1)
+                },
+                None,
+                True
+            )
+        )
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=500,
+            content=make_response(500, '未安装 ffmpeg，请先安装 ffmpeg', None, None, False)
+        )
+    except Exception as e:
+        logger.error(f"Frontend download error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content=make_response(500, f'下载准备失败: {str(e)}', None, None, False)
+        )
+
+
+@app.post("/api/frontend/analyze")
+async def frontend_analyze_video(
+    body: FrontendMediaRequest,
+    x_timestamp: str = Header(default="", alias="X-Timestamp"),
+    x_gclt_text: str = Header(default="", alias="X-GCLT-Text"),
+    x_egct_text: str = Header(default="", alias="X-EGCT-Text"),
+):
+    """为 React 前端执行视频抽帧与 AI 内容提取"""
+    validation_error = validate_request_headers(
+        x_timestamp, x_gclt_text, x_egct_text, body.video_url, body.video_id
+    )
+    if validation_error:
+        return JSONResponse(status_code=400, content=validation_error)
+
+    if not QWEN_API_KEY:
+        return JSONResponse(
+            status_code=400,
+            content=make_response(400, '未配置 QWEN_API_KEY，无法进行 AI 内容提取', None, None, False)
+        )
+
+    frames = []
+    try:
+        _, video_path = ensure_frontend_media(body, "frontend-cache")
+        frames = extract_video_frames(video_path, MAX_FRAMES)
+        if not frames:
+            return JSONResponse(
+                status_code=500,
+                content=make_response(500, '无法提取视频帧，请确保已安装 ffmpeg', None, None, False)
+            )
+
+        prompt = f"""这是从一个视频中提取的 {len(frames)} 帧关键画面。
+请根据这些画面，详细描述这个视频的内容，包括：
+1. 视频中出现的人物或物体
+2. 发生的事件或动作
+3. 场景环境
+4. 视频的主题或表达的意思
+5. 视频的整体叙事或故事线
+
+请用中文回答。"""
+
+        content = [{'type': 'text', 'text': prompt}]
+        for frame_path in frames:
+            content.append({
+                'type': 'image_url',
+                'image_url': {
+                    'url': f'data:image/jpeg;base64,{image_to_base64(frame_path)}'
+                }
+            })
+
+        qwen_client = OpenAI(
+            base_url=QWEN_API_BASE_URL,
+            api_key=QWEN_API_KEY,
+        )
+        response = qwen_client.chat.completions.create(
+            model=QWEN_MODEL_ID,
+            messages=[{
+                'role': 'user',
+                'content': content,
+            }],
+            stream=False
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content=make_response(
+                200,
+                '成功',
+                {
+                    'content': response.choices[0].message.content,
+                    'frames': len(frames),
+                    'model': QWEN_MODEL_ID
+                },
+                None,
+                True
+            )
+        )
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=500,
+            content=make_response(500, '未安装 ffmpeg，请先安装 ffmpeg', None, None, False)
+        )
+    except Exception as e:
+        logger.error(f"Frontend analyze error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content=make_response(500, f'AI 内容提取失败: {str(e)}', None, None, False)
+        )
+    finally:
+        cleanup_frames(frames)
 
 
 # ==================== 主程序入口 ====================
