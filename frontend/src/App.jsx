@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { Icon } from "./icons.jsx";
 import { analyzeVideo, cacheVideo, parseVideo, prepareDownload } from "./api.js";
-import { DEPENDENCIES, PLATFORMS, STEP_LABELS, cleanUrl, detectPlatform, progressForStatus } from "./platforms.js";
+import { DEPENDENCIES, PLATFORMS, STEP_LABELS, cleanUrl, detectPlatform, extractShareUrl, progressForStatus } from "./platforms.js";
 
 const BUSY_STATES = new Set(["parsing", "caching", "downloading", "analyzing"]);
 
@@ -54,22 +54,23 @@ export default function App() {
   }
 
   async function handleParse() {
-    const rawUrl = input.trim();
-    if (!rawUrl) {
+    const rawText = input.trim();
+    if (!rawText) {
       setStatus("error");
-      setMessage("请输入视频分享链接。");
+      setMessage("请输入视频分享文案或链接。");
       return;
     }
-    if (!/^https?:\/\//i.test(rawUrl)) {
+    const extractedUrl = extractShareUrl(rawText);
+    if (!extractedUrl) {
       setStatus("error");
-      setMessage("链接需要以 http:// 或 https:// 开头。");
+      setMessage("分享内容里需要包含 http:// 或 https:// 视频链接。");
       return;
     }
 
-    const platform = detectPlatform(rawUrl, platformId);
-    const normalized = cleanUrl(rawUrl, platform.id);
+    const platform = detectPlatform(rawText, platformId);
+    const normalized = cleanUrl(rawText, platform.id);
     setStatus("parsing");
-    setMessage(`正在调用 /api/parse，平台策略：${platform.name}。`);
+    setMessage(`已从分享文案提取链接，正在调用 /api/parse，平台策略：${platform.name}。`);
     setVideo(null);
     setPlayback(null);
     setDownload(null);
@@ -77,7 +78,7 @@ export default function App() {
 
     try {
       const data = await parseVideo(normalized);
-      setVideo({ ...data, original_url: rawUrl, cleaned_input: normalized });
+      setVideo({ ...data, original_url: normalized, cleaned_input: normalized, source_text: rawText });
       setStatus("parsed");
       setMessage("解析完成。下一步先在线播放写入本地缓存，或直接准备下载文件。");
     } catch (error) {
@@ -224,14 +225,14 @@ function InputPanel({ input, setInput, platformId, detectedPlatform, onPlatformC
       <div className="panel-header">
         <div>
           <h2 className="section-title">新建解析</h2>
-          <p className="section-note">粘贴分享链接，自动识别平台；小红书和快手会保留解析所需参数。</p>
+          <p className="section-note">粘贴完整分享文案或链接，自动识别平台；小红书和快手会保留解析所需参数。</p>
         </div>
         <span className="status-chip is-ready"><span className="status-dot" />{detectedPlatform.name}</span>
       </div>
       <div className="panel-inner input-stack">
         <label className="url-field">
           <span className="field-label">
-            <span>视频分享链接</span>
+            <span>视频分享内容</span>
             <span>{input.length} chars</span>
           </span>
           <div className="input-row">
@@ -239,7 +240,7 @@ function InputPanel({ input, setInput, platformId, detectedPlatform, onPlatformC
               className="url-input"
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder="粘贴抖音、B站、小红书、快手或好看视频链接…"
+              placeholder="粘贴抖音、B站、小红书、快手或好看视频分享文案/链接…"
               spellCheck="false"
             />
             <div className="quick-platforms" aria-label="平台示例">

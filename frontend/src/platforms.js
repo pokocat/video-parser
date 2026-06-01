@@ -74,9 +74,16 @@ export function detectPlatform(value, selected) {
   return PLATFORMS[0];
 }
 
+export function extractShareUrl(value) {
+  const match = value.match(/https?:\/\/[^\s]+/i);
+  if (!match) return "";
+  return match[0].replace(/[，。！？、；;,.!?）)】\]]+$/u, "");
+}
+
 export function cleanUrl(value, platformId) {
   try {
-    const url = new URL(value.trim());
+    const extracted = extractShareUrl(value) || value.trim();
+    const url = new URL(extracted);
     if (platformId === "xiaohongshu") {
       Array.from(url.searchParams.keys()).forEach((key) => {
         if (!["xsec_token", "xsec_source"].includes(key)) {
@@ -93,7 +100,7 @@ export function cleanUrl(value, platformId) {
     }
     return url.toString();
   } catch {
-    return value.trim();
+    return extractShareUrl(value) || value.trim();
   }
 }
 
