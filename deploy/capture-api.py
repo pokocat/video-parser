@@ -1,4 +1,7 @@
 """Loopback socket-activated video capture API. Runs in a private network namespace."""
+from collections import OrderedDict, namedtuple
+from concurrent.futures import Future, TimeoutError as FutureTimeout
+import hashlib
 import hmac
 import importlib.util
 import json
@@ -9,6 +12,7 @@ import socketserver
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import quote
@@ -20,7 +24,8 @@ RUN_DIR = Path('/run/aistar-video-capture')
 EGRESS_SOCKET = '/run/aistar-video-capture-egress/connect.sock'
 MAX_REQUEST_BYTES = 65536
 MAX_MEDIA_BYTES = 64 * 1024 * 1024
-CAPTURE = threading.BoundedSemaphore(1)
+CACHE_BYTES = 2 * MAX_MEDIA_BYTES
+CACHE_SECONDS = 5 * 60
 HANDLERS = threading.BoundedSemaphore(8)
 CAPTURE_FAILURE_DETAILS = (
     'unverified_source', 'no_complete_response', 'response_body_unavailable',
@@ -88,6 +93,130 @@ def capture_video(platform, request, work):
     return status, outcome, media
 
 
+CachedVideo = namedtuple('CachedVideo', 'path outcome expires timer')
+
+
+class SharedCaptures:
+    """Coalesce requests and keep recent successful anonymous captures by link."""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.lock = threading.Lock()
+        self.files = OrderedDict()
+        self.bytes = 0
+        self.in_flight = None
+
+    def discard(self, key):
+        entry = self.files.pop(key)
+        entry.timer.cancel()
+        self.bytes -= entry.outcome['captured_bytes']
+        try:
+            entry.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def expire(self, key):
+        with self.lock:
+            entry = self.files.get(key)
+            if entry is not None and time.monotonic() >= entry.expires:
+                self.discard(key)
+
+    def close(self):
+        with self.lock:
+            for key in list(self.files):
+                self.discard(key)
+
+    def open_video(self, key, target):
+        entry = self.files.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() >= entry.expires:
+            self.discard(key)
+            return None
+        _, expected_id, expected_title = target
+        if expected_id and expected_id != entry.outcome['video_id']:
+            return None
+        title = ''.join((entry.outcome.get('title') or '').split())
+        if expected_title and expected_title not in title:
+            return None
+        # Open under the lock so expiry can unlink the file without interrupting
+        # readers of its already-open file descriptor.
+        try:
+            stream = entry.path.open('rb')
+        except FileNotFoundError:
+            self.discard(key)
+            return None
+        self.files.move_to_end(key)
+        return entry.outcome, stream
+
+    def remember(self, key, outcome, media):
+        size = outcome['captured_bytes']
+        with self.lock:
+            if key in self.files:
+                self.discard(key)
+            while self.bytes + size > CACHE_BYTES:
+                self.discard(next(iter(self.files)))
+            path = self.directory / (key + '.mp4')
+            media.replace(path)
+            timer = threading.Timer(CACHE_SECONDS, self.expire, args=(key,))
+            timer.daemon = True
+            entry = CachedVideo(path, outcome, time.monotonic() + CACHE_SECONDS, timer)
+            self.files[key] = entry
+            self.bytes += size
+            timer.start()
+            return entry
+
+    def capture_and_store(self, key, platform, request):
+        with tempfile.TemporaryDirectory(dir=str(self.directory.parent)) as scratch:
+            try:
+                status, outcome, media = capture_video(platform, request, Path(scratch))
+                if media is None:
+                    return 502, status
+                return 200, self.remember(key, outcome, media)
+            except subprocess.TimeoutExpired:
+                return 504, 'capture_timeout'
+            except (OSError, ValueError, KeyError, TypeError):
+                print('Capture worker failed', flush=True)
+                return 503, 'capture_unavailable'
+
+    def request(self, platform, target, request):
+        url, expected_id, expected_title = target
+        key = hashlib.sha256(url.encode()).hexdigest()
+        flight_key = (key, expected_id, expected_title)
+        with self.lock:
+            cached = self.open_video(key, target)
+            if cached:
+                return (200,) + cached
+            producer = self.in_flight is None
+            if producer:
+                future = Future()
+                self.in_flight = (flight_key, future)
+            elif self.in_flight[0] == flight_key:
+                future = self.in_flight[1]
+            else:
+                return 503, {'code': 'capture_busy'}, None
+        if producer:
+            result = (503, 'capture_unavailable')
+            try:
+                result = self.capture_and_store(key, platform, request)
+            finally:
+                with self.lock:
+                    self.in_flight = None
+                    future.set_result(result)
+        try:
+            status, result = future.result(timeout=browser_playback.WORKER_TIMEOUT_SECONDS + 2)
+        except FutureTimeout:
+            return 504, {'code': 'capture_timeout'}, None
+        if status != 200:
+            return status, {'code': result}, None
+        with self.lock:
+            # The completed job already verified both request hints. Return its
+            # file even if the title hint was found in the page body.
+            if self.files.get(key) is result:
+                return 200, result.outcome, result.path.open('rb')
+        return 503, {'code': 'capture_unavailable'}, None
+
+
 class CaptureHandler(BaseHTTPRequestHandler):
     def setup(self):
         self.request.settimeout(10)
@@ -134,7 +263,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 for key in ('text', 'expected_id', 'expected_title')
             ):
                 raise ValueError('Invalid field')
-            platform, _ = browser_playback.select_target(
+            platform, target = browser_playback.select_target(
                 request['text'], expected_id=request.get('expected_id'),
                 expected_title=request.get('expected_title'), require_title=False,
             )
@@ -142,36 +271,21 @@ class CaptureHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError, UnicodeError):
             self.json_response(400, {'code': 'invalid_request'})
             return
-        if not CAPTURE.acquire(blocking=False):
-            self.json_response(503, {'code': 'capture_busy'})
+        status, outcome, stream = self.server.captures.request(platform, target, request)
+        if stream is None:
+            self.json_response(status, outcome)
             return
-        try:
-            with tempfile.TemporaryDirectory(dir=str(RUN_DIR)) as scratch:
-                try:
-                    status, outcome, media = capture_video(platform, request, Path(scratch))
-                except subprocess.TimeoutExpired:
-                    self.json_response(504, {'code': 'capture_timeout'})
-                    return
-                except (OSError, ValueError, KeyError, TypeError):
-                    print('Capture worker failed', flush=True)
-                    self.json_response(503, {'code': 'capture_unavailable'})
-                    return
-                if media is None:
-                    self.json_response(502, {'code': status})
-                    return
-                self.send_response(200)
-                self.send_header('Content-Type', 'video/mp4')
-                self.send_header('Content-Length', str(outcome['captured_bytes']))
-                self.send_header('Cache-Control', 'no-store')
-                self.send_header('X-Video-Platform', platform)
-                self.send_header('X-Video-Id', outcome['video_id'])
-                self.send_header('X-Video-Title', quote(outcome.get('title') or '', safe=''))
-                self.send_header('X-Video-Duration-Seconds', str(outcome['captured_duration']))
-                self.end_headers()
-                with media.open('rb') as stream:
-                    shutil.copyfileobj(stream, self.wfile, 1024 * 128)
-        finally:
-            CAPTURE.release()
+        with stream:
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Content-Length', str(outcome['captured_bytes']))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Video-Platform', platform)
+            self.send_header('X-Video-Id', outcome['video_id'])
+            self.send_header('X-Video-Title', quote(outcome.get('title') or '', safe=''))
+            self.send_header('X-Video-Duration-Seconds', str(outcome['captured_duration']))
+            self.end_headers()
+            shutil.copyfileobj(stream, self.wfile, 1024 * 128)
 
 
 class CaptureServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -208,7 +322,12 @@ def main():
             server.socket.close()
             server.socket = socket.socket(fileno=3)
             server.authorization = ('Bearer ' + os.environ.pop('VIDEO_PARSER_SERVICE_TOKEN')).encode()
-            server.serve_forever()
+            with tempfile.TemporaryDirectory(prefix='recent-', dir=str(RUN_DIR)) as directory:
+                server.captures = SharedCaptures(Path(directory))
+                try:
+                    server.serve_forever()
+                finally:
+                    server.captures.close()
 
 
 if __name__ == '__main__':

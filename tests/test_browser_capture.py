@@ -5,11 +5,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 
 path = Path(__file__).resolve().parents[1] / 'deploy' / 'check-browser-playback.py'
@@ -87,6 +91,129 @@ class BrowserCaptureTests(unittest.TestCase):
                     self.assertEqual(capture_api.capture_video('xiaohongshu', {'text': 'private-input'}, Path('/tmp')),
                                      ('capture_failed', None, None))
                 self.assertEqual(output.getvalue(), f'Capture failed platform=xiaohongshu detail={logged}\n')
+
+    def shared_captures(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = capture_api.SharedCaptures(Path(directory.name))
+        self.addCleanup(store.close)
+        return store
+
+    @staticmethod
+    def saved_fixture(platform, _request, work):
+        media = work / 'video.mp4'
+        media.write_bytes(b'video')
+        outcome = {'captured_bytes': 5, 'video_id': 'a' * 24, 'title': '公开视频',
+                   'platform': platform, 'captured_duration': 1}
+        return 'captured', outcome, media
+
+    def test_same_public_link_reuses_capture_across_requests_until_expiry(self):
+        link = 'https://xhslink.cn/o/fixture'
+        store = self.shared_captures()
+        with patch.object(capture_api, 'capture_video', side_effect=self.saved_fixture) as capture:
+            for text in ('第一段 ' + link, '另一段 ' + link):
+                platform, target = browser_playback.select_target(text, require_title=False)
+                status, _, video = store.request(platform, target, {'text': text})
+                self.assertEqual(status, 200)
+                with video:
+                    self.assertEqual(video.read(), b'video')
+            capture.assert_called_once()
+            deadline = next(iter(store.files.values())).expires
+            with patch.object(capture_api.time, 'monotonic', return_value=deadline + 1):
+                status, _, video = store.request(platform, target, {'text': link})
+                with video:
+                    self.assertEqual(status, 200)
+            self.assertEqual(capture.call_count, 2)
+
+    def test_login_gate_is_not_saved_or_used_for_subsequent_requests(self):
+        text = 'https://xhslink.cn/o/fixture'
+        store = self.shared_captures()
+        platform, target = browser_playback.select_target(text, require_title=False)
+        with patch.object(capture_api, 'capture_video', return_value=('login_required', None, None)) as capture:
+            self.assertEqual(store.request(platform, target, {'text': text}), (502, {'code': 'login_required'}, None))
+            self.assertEqual(store.request(platform, target, {'text': text}), (502, {'code': 'login_required'}, None))
+            self.assertEqual(capture.call_count, 2)
+            self.assertEqual(list(store.directory.iterdir()), [])
+
+    def test_concurrent_requests_for_the_same_link_join_one_capture(self):
+        text = 'https://xhslink.cn/o/fixture'
+        store = self.shared_captures()
+        platform, target = browser_playback.select_target(text, require_title=False)
+        started, joined, finish = threading.Event(), threading.Event(), threading.Event()
+
+        class ObservedFuture(Future):
+            def result(self, timeout=None):
+                if not self.done():
+                    joined.set()
+                return super().result(timeout)
+
+        def slow_capture(platform, request, work):
+            started.set()
+            if not finish.wait(timeout=5):
+                raise RuntimeError('test failed to release capture')
+            return self.saved_fixture(platform, request, work)
+
+        with patch.object(capture_api, 'Future', ObservedFuture), \
+                patch.object(capture_api, 'capture_video', side_effect=slow_capture) as capture, \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(store.request, platform, target, {'text': text})
+            try:
+                self.assertTrue(started.wait(timeout=5))
+                second = pool.submit(store.request, platform, target, {'text': '不同分享文案 '+text})
+                self.assertTrue(joined.wait(timeout=5))
+            finally:
+                finish.set()
+            for pending in (first, second):
+                status, _, video = pending.result(timeout=5)
+                self.assertEqual(status, 200)
+                with video:
+                    self.assertEqual(video.read(), b'video')
+            capture.assert_called_once()
+
+    def test_cached_link_does_not_skip_an_unverified_title_hint(self):
+        text = 'https://xhslink.cn/o/fixture'
+        store = self.shared_captures()
+        platform, target = browser_playback.select_target(text, require_title=False)
+        with patch.object(capture_api, 'capture_video', side_effect=self.saved_fixture) as capture:
+            status, _, video = store.request(platform, target, {'text': text})
+            with video:
+                self.assertEqual(status, 200)
+            hint = '只在作品正文中匹配'
+            _, validated_target = browser_playback.select_target(text, expected_title=hint, require_title=False)
+            status, _, video = store.request(platform, validated_target, {'text': text, 'expected_title': hint})
+            with video:
+                self.assertEqual(status, 200, '已校验正文的请求可以读取自己完成的抓取')
+            self.assertEqual(capture.call_count, 2)
+
+    def test_capture_endpoint_serves_shared_bytes_only_to_authenticated_callers(self):
+        with capture_api.CaptureServer(('127.0.0.1', 0), capture_api.CaptureHandler) as server, \
+                patch.object(capture_api, 'capture_video', side_effect=self.saved_fixture) as capture:
+            server.authorization = b'Bearer fixture'
+            server.captures = self.shared_captures()
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            endpoint = f'http://127.0.0.1:{server.server_port}/internal/v1/capture'
+
+            def post(text, authenticated):
+                headers = {'Content-Type': 'application/json'}
+                if authenticated:
+                    headers['Authorization'] = 'Bearer fixture'
+                return urlopen(Request(endpoint, data=json.dumps({'text': text}).encode(), headers=headers), timeout=3)
+
+            try:
+                link = 'https://xhslink.cn/o/fixture'
+                for text in (link, '分享文案 ' + link):
+                    with post(text, True) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.headers['X-Video-Platform'], 'xiaohongshu')
+                        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+                        self.assertEqual(response.read(), b'video')
+                with self.assertRaises(HTTPError) as denied:
+                    post(link, False)
+                with denied.exception as response:
+                    self.assertEqual(response.code, 401)
+                capture.assert_called_once()
+            finally:
+                server.shutdown()
 
     def test_exit_status_requires_playback_and_a_published_file_for_capture(self):
         outcome = {'matches_item': True, 'title_matches_item': True, 'visible_videos': 1,
